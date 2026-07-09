@@ -82,8 +82,6 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository }}:sha-${{ steps.tag.outputs.sha }}
             ${{ env.REGISTRY }}/${{ github.repository }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
 # ══════════════════════════════════════════════════════════════
 #  JOB 3 — DEPLOY TO AZURE CONTAINER APPS
