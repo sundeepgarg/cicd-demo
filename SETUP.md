@@ -1,184 +1,204 @@
-# Setup Guide — One Time Steps
+# Setup Guide — Azure Container Apps
 
-Run these once. After this, every `git push` to main runs the full pipeline automatically.
+Run these steps once. After this, every `git push` to main deploys automatically.
+
+---
+
+## What gets created
+
+```
+Azure
+└── rg-cicd-demo  (Resource Group)
+    └── cicd-demo-env  (Container Apps Environment — managed hosting layer)
+        └── cicd-demo  (Container App — your running app)
+              └── public HTTPS URL: https://cicd-demo.<hash>.eastus.azurecontainerapps.io
+```
+
+No AKS. No ACR. No Kubernetes to manage.
+Image comes from GHCR (free, already set up in ci.yml).
 
 ---
 
 ## Prerequisites
 
-Install these on your laptop if not already present:
-
 ```powershell
-# Azure CLI
+# Install Azure CLI if not already installed
 winget install Microsoft.AzureCLI
 
-# Terraform
-winget install Hashicorp.Terraform
-
-# kubectl
-winget install Kubernetes.kubectl
-```
-
----
-
-## Step 1 — Log in to Azure
-
-```powershell
+# Log in
 az login
-az account show   # confirm correct subscription
 ```
 
 ---
 
-## Step 2 — Create Azure infrastructure with Terraform
+## Step 1 — Make the GHCR package public
 
-```powershell
-cd D:\git_repos\cicd-demo\infra
+After your first `git push`, GitHub Actions will build and push the Docker image to GHCR.
+By default the package is private — Azure Container Apps can't pull it.
 
-terraform init
-terraform plan    # review what will be created
-terraform apply   # type 'yes' when prompted
-```
+Make it public:
+1. Go to: **github.com/sundeepgarg → Packages → cicd-demo**
+2. Click **Package settings** (bottom right)
+3. Scroll to **Danger Zone → Change visibility → Public**
 
-**What gets created:**
-- Resource group: `rg-cicd-demo`
-- ACR: `cicddemoacr<suffix>.azurecr.io`
-- AKS: `aks-cicd-demo` (1 node, Standard_B2s)
-- Role assignment: AKS can pull from ACR without imagePullSecret
-
-**After apply, note the outputs:**
-```powershell
-terraform output                              # shows ACR login server, AKS name etc.
-terraform output -raw acr_admin_password      # shows ACR password (sensitive)
-```
+> Do this after the first CI run pushes the image. The build job will succeed even if you haven't done this yet — you only need it before the deploy job runs.
 
 ---
 
-## Step 3 — Create Azure service principal for GitHub Actions
-
-GitHub Actions needs credentials to log in to Azure and deploy to AKS.
+## Step 2 — Create Azure infrastructure (one time, ~3 minutes)
 
 ```powershell
-# Get your subscription ID
-$SUBSCRIPTION_ID = az account show --query id -o tsv
+# Create resource group
+az group create --name rg-cicd-demo --location eastus
 
-# Create service principal with Contributor access to the resource group
+# Create Container Apps Environment
+# This is the managed hosting layer — handles networking, scaling, certificates
+az containerapp env create `
+  --name cicd-demo-env `
+  --resource-group rg-cicd-demo `
+  --location eastus
+
+# Create the initial Container App
+# Points to :latest image — pipeline will update it with :sha-<commit> on each deploy
+az containerapp create `
+  --name cicd-demo `
+  --resource-group rg-cicd-demo `
+  --environment cicd-demo-env `
+  --image ghcr.io/sundeepgarg/cicd-demo:latest `
+  --target-port 5000 `
+  --ingress external `
+  --min-replicas 0 `
+  --max-replicas 3
+
+# Get the public URL (note this down)
+az containerapp show `
+  --name cicd-demo `
+  --resource-group rg-cicd-demo `
+  --query "properties.configuration.ingress.fqdn" `
+  --output tsv
+```
+
+Open the URL in your browser — you should see the app running.
+
+---
+
+## Step 3 — Create service principal for GitHub Actions
+
+GitHub Actions needs permission to update the Container App on each deploy.
+
+```powershell
+$SUB = az account show --query id -o tsv
+
 az ad sp create-for-rbac `
   --name "cicd-demo-github-actions" `
   --role contributor `
-  --scopes "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-cicd-demo" `
+  --scopes "/subscriptions/$SUB/resourceGroups/rg-cicd-demo" `
   --sdk-auth
 ```
 
-This outputs a JSON block like:
+Copy the entire JSON output — looks like:
 ```json
 {
-  "clientId": "...",
-  "clientSecret": "...",
-  "subscriptionId": "...",
-  "tenantId": "...",
+  "clientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "clientSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "subscriptionId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "tenantId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   ...
 }
 ```
 
-**Copy the entire JSON** — you need it in the next step.
-
 ---
 
-## Step 4 — Add GitHub Secrets
+## Step 4 — Add GitHub Secret (only 1 needed)
 
-Go to: **GitHub repo → Settings → Secrets and variables → Actions → New repository secret**
+Go to: **github.com/sundeepgarg/cicd-demo → Settings → Secrets and variables → Actions → New repository secret**
 
-Add these 5 secrets:
-
-| Secret name | Where to get the value |
+| Secret name | Value |
 |---|---|
 | `AZURE_CREDENTIALS` | The full JSON from Step 3 |
-| `ACR_LOGIN_SERVER` | `terraform output acr_login_server` (e.g. `cicddemoacr123.azurecr.io`) |
-| `ACR_USERNAME` | `terraform output acr_admin_username` |
-| `ACR_PASSWORD` | `terraform output -raw acr_admin_password` |
-| `AKS_CLUSTER_NAME` | `terraform output aks_cluster_name` (= `aks-cicd-demo`) |
-| `AKS_RESOURCE_GROUP` | `terraform output resource_group_name` (= `rg-cicd-demo`) |
+
+That's it. Only 1 secret — compare to AKS which needed 6.
 
 ---
 
-## Step 5 — Create GitHub repo and push
+## Step 5 — Push code and watch the pipeline
 
 ```powershell
 cd D:\git_repos\cicd-demo
-
-# If not already initialised
-git init
 git add .
-git commit -m "initial commit: Flask app + CI/CD pipeline"
-git branch -M main
-
-# Create repo on github.com then:
-git remote add origin https://github.com/YOUR_USERNAME/cicd-demo.git
-git push -u origin main
+git commit -m "add Container Apps deploy"
+git push origin main
 ```
 
-The push triggers the pipeline immediately.
+Go to: **github.com/sundeepgarg/cicd-demo → Actions**
+
+You will see 3 jobs run in sequence:
+```
+1 · Unit Tests          ~1 min
+2 · Build & Push        ~2 min
+3 · Deploy to ACA       ~1 min
+                        ──────
+Total                   ~4 min
+```
+
+At the end of Job 3, click the environment URL to open your live app.
 
 ---
 
-## Step 6 — Watch the pipeline run
+## How to test the full loop
 
-1. Go to **github.com/YOUR_USERNAME/cicd-demo → Actions**
-2. You'll see "CI/CD Pipeline" running
-3. Click it to see the 3 jobs: Test → Build → Deploy
-4. After Deploy completes, click the environment URL shown to open the live app
+Make a code change and push — watch it deploy automatically:
 
----
-
-## Step 7 — Configure kubectl on your laptop (optional)
-
-To run `kubectl` commands against your AKS cluster locally:
+```python
+# app/app.py — change the message
+@app.route("/")
+def hello():
+    return jsonify({"message": "Hello — version 2!", "version": APP_VERSION})
+```
 
 ```powershell
-az aks get-credentials --resource-group rg-cicd-demo --name aks-cicd-demo
-kubectl get pods
-kubectl get svc cicd-demo   # shows public IP
+git add app/app.py
+git commit -m "update hello message"
+git push origin main
 ```
+
+Watch Actions → 4 minutes later the live URL shows the new message.
 
 ---
 
-## Cost control — stop the cluster when not using it
+## Cost
 
-AKS charges for the VMs even when idle. Stop/start the cluster to save cost:
+- **Container Apps Environment:** Free for the first environment per subscription
+- **Container App:** Free tier — 180,000 vCPU-seconds + 360,000 GB-seconds per month
+- **min-replicas 0:** scales to zero when no requests → zero cost when idle
 
-```powershell
-# Stop cluster (stops billing for VMs, free while stopped)
-az aks stop --name aks-cicd-demo --resource-group rg-cicd-demo
-
-# Start cluster again
-az aks start --name aks-cicd-demo --resource-group rg-cicd-demo
-```
-
-**Estimated cost:** ~₹2,500/month if running 24/7. Stop when not using → ~₹300/month.
+Effectively free for a learning project.
 
 ---
 
-## Tear down everything
+## Tear down
 
 ```powershell
-cd D:\git_repos\cicd-demo\infra
-terraform destroy   # deletes AKS + ACR + resource group
+az group delete --name rg-cicd-demo --yes
 ```
+
+Deletes everything including the Container App and Environment.
 
 ---
 
 ## Troubleshooting
 
-**Pipeline fails at "Log in to ACR" step**
-→ Check ACR_LOGIN_SERVER, ACR_USERNAME, ACR_PASSWORD secrets are set correctly
+**Job 3 fails: "containerapp not found"**
+→ The initial `az containerapp create` in Step 2 hasn't been run yet.
 
-**Pipeline fails at "Get AKS credentials"**
-→ Check AZURE_CREDENTIALS is the full JSON (not just clientId)
-→ Check service principal has Contributor role on the resource group
+**Job 3 fails: "unauthorized" pulling image**
+→ GHCR package is still private. Follow Step 1.
 
-**Smoke test fails — no IP yet**
-→ First deploy: LoadBalancer IP takes 2–3 minutes. Re-run the deploy job manually.
+**Smoke test fails with connection refused**
+→ Container is still starting. Increase `sleep 15` to `sleep 30` in ci.yml.
 
-**Pods in CrashLoopBackOff**
-→ Run: `kubectl logs -l app=cicd-demo` to see app error
+**App returns 502**
+→ Flask is crashing. Check logs:
+```powershell
+az containerapp logs show --name cicd-demo --resource-group rg-cicd-demo --tail 50
+```
