@@ -1,0 +1,103 @@
+name: CD — Deploy to Minikube
+
+# Triggers only when CI completes successfully on main branch
+on:
+  workflow_run:
+    workflows: ["CI — Test, Build, Push"]
+    types: [completed]
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  deploy:
+    name: Deploy to Minikube
+    runs-on: ubuntu-latest
+
+    # Only run if the CI workflow actually succeeded (not just completed)
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    permissions:
+      contents: read
+      packages: read                     # needed to pull image from GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Start a real Minikube cluster inside this GitHub Actions runner
+      # Uses Docker as the driver — works on ubuntu-latest runners
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          driver: docker
+          kubernetes-version: v1.29.0
+
+      # Verify Minikube is running
+      - name: Check cluster is ready
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+
+      # Build image SHA tag — same format CI used
+      - name: Set image tag
+        id: tag
+        run: echo "sha=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Create a Kubernetes secret so Minikube can pull the image from GHCR
+      # GITHUB_TOKEN is used — no extra secrets needed
+      - name: Create imagePullSecret for GHCR
+        run: |
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+
+      # Replace IMAGE_PLACEHOLDER and IMAGE_TAG_PLACEHOLDER in deployment.yaml
+      # with the actual image URI and git SHA built by the CI job
+      - name: Substitute image in deployment manifest
+        run: |
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}"
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" k8s/deployment.yaml
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ steps.tag.outputs.sha }}|g" k8s/deployment.yaml
+          echo "--- Deploying image: ${IMAGE} ---"
+          cat k8s/deployment.yaml
+
+      # Add the pull secret reference to the deployment
+      - name: Patch deployment to use imagePullSecret
+        run: |
+          sed -i '/containers:/i\      imagePullSecrets:\n      - name: ghcr-secret' k8s/deployment.yaml
+
+      # Apply Deployment and Service manifests to Minikube
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      # Wait for pods to be running — fails the job if pods crash
+      - name: Wait for rollout to complete
+        run: kubectl rollout status deployment/cicd-demo --timeout=120s
+
+      # Show pod status so we can see both replicas are Running
+      - name: Show running pods
+        run: |
+          kubectl get pods -o wide
+          kubectl get service cicd-demo
+
+      # Hit the app endpoint and verify it responds correctly
+      - name: Smoke test — call the app
+        run: |
+          APP_URL=$(minikube service cicd-demo --url)
+          echo "App URL: ${APP_URL}"
+          curl -f "${APP_URL}/"
+          curl -f "${APP_URL}/health"
+
+      # Show pod logs if anything failed above
+      - name: Show pod logs on failure
+        if: failure()
+        run: |
+          kubectl describe pods -l app=cicd-demo
+          kubectl logs -l app=cicd-demo --tail=50
